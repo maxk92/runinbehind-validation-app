@@ -1,0 +1,13 @@
+# venv
+.venv/
+venv/
+
+# Claude
+CLAUDE.md
+.claude/
+
+# data
+data/
+output/
+
+__pycache__
