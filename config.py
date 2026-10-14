@@ -19,3 +19,7 @@ CLICK_THRESHOLD_M = 3.5
 
 # Boundary drag detection (pixels)
 BOUNDARY_THRESHOLD_PX = 10
+
+# Annotation source channels
+DEFAULT_ANNOTATION_SOURCES = 2
+MAX_ANNOTATION_SOURCES     = 6

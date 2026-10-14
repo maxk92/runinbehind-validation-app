@@ -14,6 +14,11 @@ Two modes:
       • Click on empty space deactivates + seeks.
 
 Both modes support:
+  • Ctrl+click on overlapping segments raises the lowest one under the cursor
+    to the top and selects it; repeated ctrl+clicks cycle through the stack.
+    Clicks, double-clicks and right-clicks always act on the topmost segment.
+  • Optional stacked layout (set_stacked): overlapping segments are drawn in
+    separate sub-rows so none is hidden.  Display only — data is unchanged.
   • Middle-mouse pan.
   • Scroll-wheel zoom (both emit visible_range_changed).
   • Animated red playhead cursor.
@@ -26,10 +31,15 @@ import matplotlib.patches as mpatches
 import matplotlib.transforms as mtransforms
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QApplication, QSizePolicy, QVBoxLayout, QWidget
 
 from config import BOUNDARY_THRESHOLD_PX
+
+# Vertical extent of the segment band (axes fraction)
+_BAND_Y0 = 0.05
+_BAND_H  = 0.90
+_LANE_GAP = 0.03
 
 
 class ValidationTimeline(QWidget):
@@ -47,25 +57,42 @@ class ValidationTimeline(QWidget):
         self.setMinimumHeight(40)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        fig = Figure(figsize=(10, 0.5), tight_layout={"pad": 0.15})
+        fig = Figure(figsize=(10, 0.5))
         fig.patch.set_facecolor("#1e1e1e")
         self._canvas = FigureCanvasQTAgg(fig)
         self._ax = fig.add_subplot(111)
         self._ax.set_facecolor("#2a2a2a")
-        self._ax.tick_params(colors="grey", labelsize=7)
         self._ax.set_yticks([])
         self._ax.set_ylim(0, 1)
         for spine in self._ax.spines.values():
             spine.set_color("#444444")
+        # All timelines use the same left/right fractions so the axes pixel
+        # extents are identical across widgets of the same width — this keeps
+        # tick marks vertically aligned.  Only the bottom (Result) timeline
+        # shows labels; the annotator timelines show tick lines only.
+        if self._readonly:
+            self._ax.tick_params(colors="grey", labelbottom=False,
+                                 length=3, width=0.5)
+            fig.subplots_adjust(left=0.0, right=1.0, bottom=0.12, top=0.98)
+        else:
+            self._ax.tick_params(colors="grey", labelsize=7, length=4)
+            fig.subplots_adjust(left=0.0, right=1.0, bottom=0.30, top=0.98)
 
         # Blended transform: x = data coords, y = axes fraction
         self._xform = mtransforms.blended_transform_factory(
             self._ax.transData, self._ax.transAxes
         )
 
-        # Segment data: [{rect, text, start, end, seg_id, color}, ...]
+        # Segment data: [{rect, text, start, end, seg_id, color, y0, h}, ...]
         self._seg_data: list[dict] = []
         self._active_idx: int = -1
+
+        # Stacking: each segment gets a higher zorder than the previous one;
+        # ctrl+click raises a segment above all others.
+        self._z_top: float = 2.0
+
+        # Lane layout for overlapping segments (display only)
+        self._stacked: bool = False
 
         # Animated playhead
         self._cursor = self._ax.axvline(
@@ -134,23 +161,31 @@ class ValidationTimeline(QWidget):
 
     def add_segment(self, start: int, end: int, seg_id: int,
                     label: str = "", color: str = "#AAAAAA") -> None:
+        self._z_top += 1
         rect = mpatches.Rectangle(
-            (start, 0.05), end - start, 0.90,
+            (start, _BAND_Y0), end - start, _BAND_H,
             transform=self._xform,
-            facecolor=color, alpha=0.75, edgecolor="none", lw=0, zorder=2,
+            facecolor=color, alpha=0.75, edgecolor="none", lw=0,
+            zorder=self._z_top, clip_on=True,
         )
         self._ax.add_patch(rect)
+        rect.set_clip_path(self._ax.patch)
 
         text = self._ax.text(
             (start + end) / 2, 0.5, label,
             transform=self._xform,
             ha="center", va="center",
-            fontsize=8, color="white", fontweight="bold", zorder=3,
+            fontsize=8, color="white", fontweight="bold",
+            zorder=self._z_top + 0.5, clip_on=True,
         )
+        text.set_clip_path(self._ax.patch)
         self._seg_data.append(
             {"rect": rect, "text": text, "start": start, "end": end,
-             "seg_id": seg_id, "color": color}
+             "seg_id": seg_id, "color": color,
+             "y0": _BAND_Y0, "h": _BAND_H}
         )
+        if self._stacked:
+            self._relayout_lanes()
         self._bg = None
         self._canvas.draw_idle()
 
@@ -165,6 +200,8 @@ class ValidationTimeline(QWidget):
             self._active_idx = -1
         elif self._active_idx > seg_idx:
             self._active_idx -= 1
+        if self._stacked:
+            self._relayout_lanes()
         self._bg = None
         self._canvas.draw_idle()
 
@@ -197,6 +234,78 @@ class ValidationTimeline(QWidget):
             self._seg_data[seg_idx]["rect"].set_linewidth(2.0)
         self._bg = None
         self._canvas.draw_idle()
+
+    def raise_segment(self, seg_idx: int) -> None:
+        """Draw segment *seg_idx* above all others (display only)."""
+        if not (0 <= seg_idx < len(self._seg_data)):
+            return
+        self._z_top += 1
+        entry = self._seg_data[seg_idx]
+        entry["rect"].set_zorder(self._z_top)
+        entry["text"].set_zorder(self._z_top + 0.5)
+        self._bg = None
+        self._canvas.draw_idle()
+
+    # ------------------------------------------------------------------
+    # Lane layout (stacked sub-rows for overlapping segments)
+    # ------------------------------------------------------------------
+
+    def set_stacked(self, stacked: bool) -> None:
+        self._stacked = stacked
+        self._relayout_lanes()
+        self._bg = None
+        self._canvas.draw_idle()
+
+    def _relayout_lanes(self) -> None:
+        """Assign each segment a lane so overlapping segments never share one.
+
+        Segments are grouped into overlap clusters; within each cluster,
+        greedy interval partitioning puts each segment (sorted by start) into
+        the first lane whose last segment ends at or before its start.  Each
+        cluster is split only into as many rows as it needs, so isolated
+        segments stay full height.
+        """
+        n = len(self._seg_data)
+        lanes   = [0] * n   # lane index per segment
+        n_lanes = [1] * n   # lane count of the segment's cluster
+        if self._stacked:
+            order = sorted(range(n), key=lambda j: (self._seg_data[j]["start"],
+                                                    self._seg_data[j]["end"]))
+            cluster: list[int] = []
+            lane_ends: list[int] = []
+            cluster_end = None
+
+            def close_cluster() -> None:
+                for j in cluster:
+                    n_lanes[j] = len(lane_ends)
+
+            for i in order:
+                entry = self._seg_data[i]
+                if cluster_end is not None and entry["start"] >= cluster_end:
+                    close_cluster()
+                    cluster, lane_ends, cluster_end = [], [], None
+                for lane, last_end in enumerate(lane_ends):
+                    if last_end <= entry["start"]:
+                        lanes[i] = lane
+                        lane_ends[lane] = entry["end"]
+                        break
+                else:
+                    lanes[i] = len(lane_ends)
+                    lane_ends.append(entry["end"])
+                cluster.append(i)
+                cluster_end = (entry["end"] if cluster_end is None
+                               else max(cluster_end, entry["end"]))
+            close_cluster()
+
+        for entry, lane, k in zip(self._seg_data, lanes, n_lanes):
+            lane_h = _BAND_H / k
+            h      = lane_h - _LANE_GAP if k > 1 else _BAND_H
+            y0     = _BAND_Y0 + lane * lane_h
+            entry["y0"], entry["h"] = y0, h
+            entry["rect"].set_y(y0)
+            entry["rect"].set_height(h)
+            entry["text"].set_y(y0 + h / 2)
+            entry["text"].set_fontsize(8 if k == 1 else max(5, 8 - k))
 
     # ------------------------------------------------------------------
     # Playhead
@@ -234,11 +343,20 @@ class ValidationTimeline(QWidget):
                 return i, "end"
         return None
 
-    def _hit_segment_body(self, x: float) -> int:
-        for i, entry in enumerate(self._seg_data):
-            if entry["start"] < x < entry["end"]:
-                return i
-        return -1
+    def _hits_at(self, x: float, y: float | None) -> list[int]:
+        """Indices of segments under (x, y), topmost (highest zorder) first."""
+        hits = [
+            i for i, entry in enumerate(self._seg_data)
+            if entry["start"] < x < entry["end"]
+            and (y is None or entry["y0"] <= y <= entry["y0"] + entry["h"])
+        ]
+        hits.sort(key=lambda i: self._seg_data[i]["rect"].get_zorder(),
+                  reverse=True)
+        return hits
+
+    def _hit_segment_body(self, x: float, y: float | None = None) -> int:
+        hits = self._hits_at(x, y)
+        return hits[0] if hits else -1
 
     # ------------------------------------------------------------------
     # Mouse events
@@ -257,10 +375,11 @@ class ValidationTimeline(QWidget):
         x = event.xdata
         if x is None:
             return
+        y = event.ydata  # ylim is (0, 1), so this equals the axes fraction
 
         # Right-click in editable mode → remove segment
         if event.button == 3 and not self._readonly:
-            body_idx = self._hit_segment_body(x)
+            body_idx = self._hit_segment_body(x, y)
             if body_idx >= 0:
                 self.remove_segment(body_idx)
                 self.segment_removed.emit(body_idx)
@@ -268,6 +387,16 @@ class ValidationTimeline(QWidget):
 
         if event.button != 1:
             return
+
+        # Ctrl+click → raise the lowest segment under the cursor (cycles stack)
+        ctrl = bool(QApplication.keyboardModifiers()
+                    & Qt.KeyboardModifier.ControlModifier)
+        if ctrl and not event.dblclick:
+            hits = self._hits_at(x, y)
+            if hits:
+                self.raise_segment(hits[-1])
+                self.set_active_segment(hits[-1])
+                return
 
         # Boundary drag (editable mode)
         if not self._readonly:
@@ -277,7 +406,7 @@ class ValidationTimeline(QWidget):
                 return
 
         # Segment body
-        body_idx = self._hit_segment_body(x)
+        body_idx = self._hit_segment_body(x, y)
         if body_idx >= 0:
             self.set_active_segment(body_idx)
             # Double-click in readonly mode → copy to result
@@ -354,12 +483,20 @@ class ValidationTimeline(QWidget):
     def _on_scroll(self, event) -> None:
         if event.inaxes is not self._ax:
             return
-        factor    = 1.15 if event.step > 0 else 1 / 1.15
+        factor      = 1.15 if event.step > 0 else 1 / 1.15
         left, right = self._ax.get_xlim()
-        anchor    = event.xdata if event.xdata is not None else (left + right) / 2
-        half_span = (right - left) / 2
-        new_left  = max(float(self._data_first), anchor - half_span / factor)
-        new_right = min(float(self._data_last),  anchor + half_span / factor)
+        anchor      = event.xdata if event.xdata is not None else (left + right) / 2
+        half_span   = (right - left) / 2
+        target_span = 2.0 * half_span / factor
+        new_left    = anchor - half_span / factor
+        new_right   = anchor + half_span / factor
+        # Slide window to stay within data bounds while preserving the target span.
+        if new_right > self._data_last:
+            new_right = float(self._data_last)
+            new_left  = new_right - target_span
+        if new_left < self._data_first:
+            new_left  = float(self._data_first)
+            new_right = min(float(self._data_last), new_left + target_span)
         if new_right <= new_left:
             return
         self._ax.set_xlim(new_left, new_right)
